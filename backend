@@ -1,0 +1,95 @@
+from flask import Flask, jsonify, request
+from flask_cors import CORS
+import psutil
+import time
+import threading
+import logging
+import json
+from scapy.all import *
+import numpy as np
+
+app = Flask(__name__)
+CORS(app)
+
+# Global variables for system state
+system_state = {
+    "is_active": False,
+    "current_mode": "home",
+    "connection_status": "connected",
+    "traffic_alerts": [],
+    "network_stats": {
+        "incoming": [],
+        "outgoing": []
+    }
+}
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    filename='network_guardian.log'
+)
+
+def collect_network_stats():
+    """Background thread to collect network statistics"""
+    while True:
+        try:
+            # Get network I/O statistics
+            net_io = psutil.net_io_counters()
+            
+            # Add to network stats (keep last 6 data points)
+            system_state["network_stats"]["incoming"] = system_state["network_stats"]["incoming"][-5:] + [net_io.bytes_recv]
+            system_state["network_stats"]["outgoing"] = system_state["network_stats"]["outgoing"][-5:] + [net_io.bytes_sent]
+            
+            # Simple anomaly detection
+            if len(system_state["network_stats"]["incoming"]) > 1:
+                prev = system_state["network_stats"]["incoming"][-2]
+                curr = system_state["network_stats"]["incoming"][-1]
+                if curr > prev * 2:  # Traffic spike detected
+                    alert = f"Traffic spike detected: {curr/1024/1024:.2f} MB/s"
+                    system_state["traffic_alerts"].append(alert)
+                    logging.warning(alert)
+            
+            time.sleep(10)  # Update every 10 seconds
+        except Exception as e:
+            logging.error(f"Error collecting network stats: {str(e)}")
+
+# Start network stats collection thread
+stats_thread = threading.Thread(target=collect_network_stats, daemon=True)
+stats_thread.start()
+
+@app.route('/api/system/status', methods=['GET'])
+def get_system_status():
+    return jsonify({
+        "is_active": system_state["is_active"],
+        "current_mode": system_state["current_mode"],
+        "connection_status": system_state["connection_status"]
+    })
+
+@app.route('/api/system/toggle', methods=['POST'])
+def toggle_system():
+    system_state["is_active"] = not system_state["is_active"]
+    status = "activated" if system_state["is_active"] else "deactivated"
+    logging.info(f"System {status}")
+    return jsonify({"success": True, "is_active": system_state["is_active"]})
+
+@app.route('/api/system/mode', methods=['POST'])
+def set_mode():
+    data = request.get_json()
+    system_state["current_mode"] = data.get("mode", "home")
+    logging.info(f"Mode changed to {system_state['current_mode']}")
+    return jsonify({"success": True, "current_mode": system_state["current_mode"]})
+
+@app.route('/api/network/stats', methods=['GET'])
+def get_network_stats():
+    return jsonify({
+        "incoming": system_state["network_stats"]["incoming"],
+        "outgoing": system_state["network_stats"]["outgoing"]
+    })
+
+@app.route('/api/alerts', methods=['GET'])
+def get_alerts():
+    return jsonify(system_state["traffic_alerts"][-10:])  # Return last 10 alerts
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=5000, debug=True)
